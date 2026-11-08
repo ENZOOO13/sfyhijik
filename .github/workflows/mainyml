@@ -1,0 +1,151 @@
+
+name: Secure Windows + Tailscale + RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Secure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          # Create a standard local user (NOT administrator)
+          $username = "rdpuser"
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($null -eq $existing) {
+              New-LocalUser -Name $username `
+                -Password $securePass `
+                -PasswordNeverExpires `
+                -AccountNeverExpires | Out-Null
+          }
+          else {
+              Set-LocalUser -Name $username `
+                -Password $securePass `
+                -PasswordNeverExpires $true
+          }
+
+          # Grant Remote Desktop access only
+          $members = Get-LocalGroupMember -Group "Remote Desktop Users"
+
+          if (-not ($members | Where-Object { $_.Name -match "\\rdpuser$" })) {
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          }
+
+          # Enable RDP with NLA and TLS security
+          $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $tcpPath = "$rdpPath\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $rdpPath `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty -Path $tcpPath `
+            -Name UserAuthentication -Value 1
+
+          Set-ItemProperty -Path $tcpPath `
+            -Name SecurityLayer -Value 2
+
+          Set-ItemProperty -Path $tcpPath `
+            -Name MinEncryptionLevel -Value 3
+
+          # Disable default broad RDP firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          # Allow RDP only from Tailscale IPv4 addresses
+          New-NetFirewallRule `
+            -DisplayName "Secure RDP - Tailscale Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+          Write-Host "Secure RDP configuration completed."
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (-not $ip) {
+              throw "Tailscale IP was not assigned."
+          }
+
+          "TAILSCALE_IP=$ip" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale IP: $ip"
+
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $connected = $false
+
+          for ($i = 0; $i -lt 24; $i++) {
+              $result = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port 3389 `
+                -WarningAction SilentlyContinue
+
+              if ($result.TcpTestSucceeded) {
+                  $connected = $true
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $connected) {
+              throw "RDP connection test failed."
+          }
+
+          Write-Host "RDP is responding."
+
+      - name: Maintain Secure Session
+        shell: pwsh
+        run: |
+          Write-Host "================================="
+          Write-Host "SECURE RDP SESSION"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: .\rdpuser"
+          Write-Host "Password: Your GitHub RDP_PASSWORD secret"
+          Write-Host "NLA: Enabled"
+          Write-Host "Tailscale: Connected"
+          Write-Host "================================="
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP session active."
+              Start-Sleep -Seconds 300
+          }
